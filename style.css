@@ -41,6 +41,9 @@ body.t-plain{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
 .t-plain .seg,.t-plain .seg button{border-radius:8px}
 .switcher{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .switcher p{margin:2px 0 0;font-size:14px}
+.sync{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:12px}
+.sync p{margin:2px 0 0;font-size:14px}
+.sync .label{margin:0}
 
 .qitem{display:flex;align-items:center;gap:14px;justify-content:space-between;flex-wrap:wrap;margin-bottom:12px}
 .t-color .qitem{box-shadow:inset 7px 0 0 var(--c), var(--shadow);padding-left:26px}

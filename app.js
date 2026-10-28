@@ -176,14 +176,18 @@ async function copyText(text){
 function load(){
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw){ const s = JSON.parse(raw); return { quizzes: Array.isArray(s.quizzes) ? s.quizzes.map(cleanQuiz).filter(Boolean) : [], theme: s.theme === 'plain' ? 'plain' : 'color' }; }
+    if (raw){
+      const s = JSON.parse(raw);
+      const sync = s.sync && typeof s.sync === 'object' ? { uid: s.sync.uid || null, hashes: s.sync.hashes && typeof s.sync.hashes === 'object' ? s.sync.hashes : {} } : { uid: null, hashes: {} };
+      return { quizzes: Array.isArray(s.quizzes) ? s.quizzes.map(cleanQuiz).filter(Boolean) : [], theme: s.theme === 'plain' ? 'plain' : 'color', sync };
+    }
   } catch(e){}
-  return { quizzes: [], theme: 'color' };
+  return { quizzes: [], theme: 'color', sync: { uid: null, hashes: {} } };
 }
 function cleanQuiz(qz){
   if (!qz || !Array.isArray(qz.questions)) return null;
   return {
-    id: qz.id || uid(), name: String(qz.name || 'Untitled quiz'), created: qz.created || Date.now(),
+    id: qz.id || uid(), name: String(qz.name || 'Untitled quiz'), created: qz.created || Date.now(), updated: qz.updated || 0,
     questions: qz.questions.filter(q => q && q.q && Array.isArray(q.options) && q.options.length >= 2).map(q => ({
       id: q.id || uid(), topic: q.topic || '', q: String(q.q),
       options: q.options.map(o => ({ t: String(o.t ?? ''), c: !!o.c })),
@@ -192,10 +196,12 @@ function cleanQuiz(qz){
   };
 }
 let state = load();
-function save(){
+function persist(){
   try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
   catch(e){ toast('Couldn\'t save. Your browser may be blocking storage, so use Export backup.'); }
 }
+// Every change goes through save(): it stamps changed quizzes, stores them on this device and queues a cloud upload.
+function save(){ markChanges(); persist(); schedulePush(); }
 const getQuiz = id => state.quizzes.find(q => q.id === id);
 const topicsOf = qz => [...new Set(qz.questions.map(q => q.topic || 'General'))];
 const missedOf = qz => qz.questions.filter(q => q.missed);
@@ -254,6 +260,7 @@ const VIEWS = {
           <button data-act="theme" data-v="plain" class="${state.theme === 'plain' ? 'on' : ''}">○ Simple</button>
         </div>
       </section>
+      ${accountCard()}
       <div class="row">
         <button class="btn" data-act="goImport">+ Import questions</button>
         <button class="btn ghost" data-act="copyPrompt">Copy question prompt</button>
@@ -580,8 +587,139 @@ function confetti(){
   setTimeout(() => box.remove(), 5000);
 }
 
+// ---------- cloud sync (Firebase) ----------
+// Quizzes live in Firestore at users/{uid}/quizzes/{quizId}. This device keeps a full copy in
+// localStorage, so the app works offline. state.sync.hashes remembers what each quiz looked like
+// when it last matched the cloud: a different hash means "changed here, upload it", and a hash
+// for a quiz that no longer exists means "deleted here, tell the other devices".
+const cloud = { ready: false, user: null, loaded: false, status: '', unsub: null, pushing: false, timer: null, warned: {} };
+
+function hashStr(s){
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < s.length; i++){ const c = s.charCodeAt(i); h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677); }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
+}
+const quizHash = qz => hashStr(JSON.stringify([qz.name, qz.created, qz.questions]));
+const isDirty = qz => quizHash(qz) !== state.sync.hashes[qz.id];
+function anyDirty(){
+  const live = new Set(state.quizzes.map(q => q.id));
+  return state.quizzes.some(isDirty) || Object.keys(state.sync.hashes).some(id => !live.has(id));
+}
+function markChanges(){
+  const now = Date.now();
+  state.quizzes.forEach(qz => { if (isDirty(qz)) qz.updated = now; });
+}
+
+function statusText(){
+  return ({ syncing: 'Syncing…', synced: 'All changes synced ✓', offline: 'Offline. Changes will sync when you\'re back online.',
+            error: 'Sync problem. Your quizzes are still saved on this device.' })[cloud.status] || '';
+}
+function setStatus(s){
+  cloud.status = s;
+  const el = document.getElementById('syncStatus');
+  if (el) el.textContent = statusText();
+}
+function schedulePush(delay){
+  if (!cloud.user) return;
+  clearTimeout(cloud.timer);
+  cloud.timer = setTimeout(push, delay == null ? 1200 : delay);
+}
+async function push(){
+  if (!cloud.user || !cloud.loaded || cloud.pushing) return; // wait until the cloud copy has been merged in first
+  const uid = cloud.user.uid, hashes = state.sync.hashes, jobs = [];
+  state.quizzes.forEach(qz => {
+    if (!isDirty(qz)) return;
+    const h = quizHash(qz);
+    const data = { name: qz.name, created: qz.created, updated: qz.updated || Date.now(), deleted: false, questions: qz.questions };
+    if (JSON.stringify(data).length > 900000){ // Firestore documents max out at 1 MB
+      if (!cloud.warned[qz.id]){ cloud.warned[qz.id] = 1; toast('“' + qz.name + '” is too big to sync. Split it into smaller quizzes.'); }
+      return;
+    }
+    jobs.push(Cloud.put(uid, qz.id, data).then(() => { hashes[qz.id] = h; }));
+  });
+  const live = new Set(state.quizzes.map(q => q.id));
+  Object.keys(hashes).forEach(id => {
+    if (!live.has(id)) jobs.push(Cloud.put(uid, id, { deleted: true, updated: Date.now() }).then(() => { delete hashes[id]; }));
+  });
+  if (!jobs.length){ setStatus(navigator.onLine ? 'synced' : 'offline'); return; }
+  cloud.pushing = true;
+  setStatus(navigator.onLine ? 'syncing' : 'offline');
+  try { await Promise.all(jobs); persist(); setStatus('synced'); }
+  catch(e){ console.error('Sync failed', e); setStatus('error'); }
+  finally { cloud.pushing = false; }
+  if (cloud.status === 'synced' && anyDirty()) schedulePush(300); // something changed while uploading
+}
+
+// Merge the cloud copy into this device. Newest edit wins for each quiz.
+function applyRemote(docs){
+  const hashes = state.sync.hashes;
+  let changed = false;
+  docs.forEach(d => {
+    const i = state.quizzes.findIndex(q => q.id === d.id);
+    const local = i >= 0 ? state.quizzes[i] : null;
+    const remoteTime = d.updated || 0, localTime = local ? local.updated || 0 : 0;
+    if (d.deleted){
+      if (local && localTime <= remoteTime){ state.quizzes.splice(i, 1); changed = true; }
+      if (!local || localTime <= remoteTime) delete hashes[d.id];
+      return;
+    }
+    const r = cleanQuiz({ ...d, id: d.id });
+    if (!r) return;
+    const rh = quizHash(r);
+    if (!local){ state.quizzes.push(r); hashes[r.id] = rh; changed = true; }
+    else if (remoteTime > localTime){ state.quizzes[i] = r; hashes[r.id] = rh; changed = true; }
+    else if (quizHash(local) === rh) hashes[r.id] = rh;
+    // otherwise this device has the newer version, and push() uploads it
+  });
+  if (changed) state.quizzes.sort((a, b) => (b.created || 0) - (a.created || 0));
+  persist();
+  cloud.loaded = true;
+  if (changed && ['home', 'manage', 'setup', 'results'].includes(view)) render(false);
+  schedulePush(200);
+}
+
+function initCloud(){
+  if (cloud.ready || !window.Cloud) return;
+  cloud.ready = true;
+  Cloud.onAuth(user => {
+    if (cloud.unsub){ cloud.unsub(); cloud.unsub = null; }
+    clearTimeout(cloud.timer);
+    cloud.user = user; cloud.loaded = false;
+    if (user){
+      if (state.sync.uid !== user.uid){ state.sync = { uid: user.uid, hashes: {} }; persist(); }
+      setStatus(navigator.onLine ? 'syncing' : 'offline');
+      cloud.unsub = Cloud.subscribe(user.uid, applyRemote, err => { console.error('Sync error', err); setStatus('error'); });
+    } else setStatus('');
+    if (view === 'home') render(false);
+  });
+}
+function accountCard(){
+  if (!cloud.ready) return '';
+  if (!cloud.user) return `<section class="card sync anim">
+      <div><p class="label">Sync</p><p class="muted">Sign in to keep your quizzes in sync on your phone and laptop.</p></div>
+      <button class="btn sm" data-act="signIn">Sign in with Google</button></section>`;
+  return `<section class="card sync anim">
+      <div><p class="label">Synced as ${esc(cloud.user.name)}</p><p class="muted" id="syncStatus">${esc(statusText())}</p></div>
+      <button class="btn sm ghost" data-act="signOut">Sign out</button></section>`;
+}
+
 // ---------- actions ----------
 const ACTIONS = {
+  async signIn(){
+    try { await Cloud.signIn(); }
+    catch(e){
+      console.error(e);
+      toast(e && e.code === 'auth/unauthorized-domain'
+        ? 'This web address isn\'t allowed yet. Add it in Firebase under Authentication → Settings → Authorized domains.'
+        : 'Sign-in didn\'t work. Please try again.');
+    }
+  },
+  async signOut(){
+    if (!confirm('Sign out? Your quizzes stay on this device, but stop syncing.')) return;
+    await Cloud.signOut();
+  },
   home: () => go('home'),
   theme: el => { state.theme = el.dataset.v; save(); applyTheme(); render(true); },
   goImport: () => { impState.target = '__new'; go('import'); },
@@ -654,6 +792,11 @@ document.addEventListener('keydown', e => {
   }
 });
 
+window.addEventListener('cloud-ready', initCloud);
+window.addEventListener('online', () => schedulePush(500));
+window.addEventListener('offline', () => { if (cloud.user) setStatus('offline'); });
+
 applyTheme();
 render(true);
+initCloud(); // in case firebase.js finished loading first
 })();
